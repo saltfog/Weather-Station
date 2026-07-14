@@ -56,8 +56,8 @@ static inline uint16_t rgb(uint8_t r, uint8_t g, uint8_t b){
 }
 
 // Deep navy background
-#define BG          rgb(6, 6, 20)
-#define BG_CARD     rgb(6, 6, 20)
+#define BG          rgb(0, 0, 0)
+#define BG_CARD     rgb(0, 0, 0)
 #define CLR_BLACK   0x0000u
 #define CLR_WHITE   0xFFFFu
 

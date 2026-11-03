@@ -41,14 +41,19 @@ Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 #endif
 
 // ── Location (Ogden, UT) ────────────────────────────
-// Change these to your coordinates and timezone offset
+// Change these values to move the station to another location.
 static const float  LOC_LAT      = 41.1092;
 static const float  LOC_LON      = -111.9465;
-static const int    UTC_OFFSET   = -7;          // hours from UTC
 static const char*  LOC_NAME     = "OGDEN UTAH";
 
+// POSIX timezone rules for Mountain Time, including the daylight-saving
+// transition dates used in the United States.
+static const char*  TIMEZONE     = "MST7MDT,M3.2.0,M11.1.0";
+
 // ── Update Interval ───────────────────────────────────────────
-#define UPDATE_INTERVAL_MS  (5UL * 60UL * 1000UL)   // 5 minutes
+#define UPDATE_INTERVAL_MS  (5UL * 60UL * 1000UL)       // refresh readings every 5 minutes
+#define WIFI_RETRY_INTERVAL_MS (30UL * 1000UL)          // start another connection attempt after 30 seconds
+#define WIFI_CONNECT_TIMEOUT_MS (18UL * 1000UL)        // let each attempt run for up to 18 seconds
 
 // ── Color Palette ─────────────────────────────────────────────
 static inline uint16_t rgb(uint8_t r, uint8_t g, uint8_t b){
@@ -84,14 +89,14 @@ static inline uint16_t rgb(uint8_t r, uint8_t g, uint8_t b){
 
 // ── Weather Data Struct ───────────────────────────────────────
 struct WeatherData {
-    float  temp_c;          // current temperature °F
-    float  feels_like_c;    // apparent temperature °F
-    float  temp_max_c;      // daily max °F
-    float  temp_min_c;      // daily min °F
+    float  temp_f;          // current temperature, converted from the API's Celsius
+    float  feels_like_f;    // apparent temperature, converted from the API's Celsius
+    float  temp_max_f;      // daily maximum temperature, converted to Fahrenheit
+    float  temp_min_f;      // daily minimum temperature, converted to Fahrenheit
     int    humidity;        // relative humidity %
     float  wind_kmh;        // wind speed km/h
     int    wind_dir;        // wind direction degrees
-    float  precip_mm;       // precipitation mm
+    float  precip_mm;       // daily precipitation total in millimeters, as returned by the API
     int    weather_code;    // WMO weather code
     int    uv_index;        // UV index (integer)
     bool   is_day;          // daytime flag
@@ -102,8 +107,12 @@ WeatherData wx = {};
 bool        wifiConnected  = false;
 bool        pulseOn        = true;
 unsigned long lastPulse    = 0;
-unsigned long lastUpdate   = 0;
-bool        firstDraw      = true;
+unsigned long lastUpdate   = 0;    // time the last weather request finished
+unsigned long lastWifiAttempt = 0; // start time of the most recent Wi-Fi attempt
+unsigned long wifiAttemptStarted = 0;
+bool        wifiAttemptPending = false; // true while Wi-Fi is still associating
+bool        weatherFetchPending = true; // fetch immediately when the station connects
+bool        wifiStatusChanged = false;  // redraw the header when the IP becomes available or is lost
 
 // ── WMO Code → Short Label ────────────────────────────────────
 // Returns a short description (max ~10 chars for size-1 font)
@@ -244,6 +253,16 @@ void drawWeatherScreen(){
     // Location name (left)
     txt(LOC_NAME, 4, 4, ACCENT_TEAL, 1);
 
+    // Show the current local-network address beside the location only while
+    // connected. Keeping it out of the stored weather data ensures it always
+    // reflects the ESP32's current Wi-Fi connection.
+    if(WiFi.status() == WL_CONNECTED){
+        int ipLabelX = 4 + strlen(LOC_NAME) * 6 + 8;
+        txt("IP:", ipLabelX, 4, TXT_LABEL, 1);
+        String ipAddress = WiFi.localIP().toString();
+        txt(ipAddress.c_str(), ipLabelX + 20, 4, TXT_SECONDARY, 1);
+    }
+
     // Single tm declaration for the whole function
     struct tm ti;
 
@@ -257,8 +276,8 @@ void drawWeatherScreen(){
     // ── MAIN TEMPERATURE ─────────────────────────────────────
     if(wx.valid){
         // Large temperature number — use size-3 for the number
-        char tbuf[8];
-        int t = (int)roundf(wx.temp_c);
+        char tbuf[4];
+        int t = (int)roundf(wx.temp_f);
         snprintf(tbuf, sizeof(tbuf), "%d", t);
 
         // Calculate width to center: digits * 18px (sz=3) + degree symbol
@@ -272,7 +291,7 @@ void drawWeatherScreen(){
         tft.print(tbuf);
 
         // Degree + unit at size 2, aligned to top-right of big number
-        tft.setTextSize(1);
+        tft.setTextSize(2);
         tft.setTextColor(TXT_SECONDARY);
         tft.setCursor(startX + numW + 3, 24);
         tft.print(DEG "F");
@@ -283,11 +302,11 @@ void drawWeatherScreen(){
 
         // ── FEELS LIKE + MAX/MIN ──────────────────────────────
         char flbuf[24];
-        snprintf(flbuf, sizeof(flbuf), "FEELS %d" DEG "F", (int)roundf(wx.feels_like_c));
+        snprintf(flbuf, sizeof(flbuf), "FEELS %d" DEG "F", (int)roundf(wx.feels_like_f));
         txt(flbuf, 4, 65, TXT_LABEL, 1);
 
         char mmbuf[24];
-        snprintf(mmbuf, sizeof(mmbuf), "%d" DEG "/%d" DEG, (int)roundf(wx.temp_max_c), (int)roundf(wx.temp_min_c));
+        snprintf(mmbuf, sizeof(mmbuf), "%d" DEG "/%d" DEG, (int)roundf(wx.temp_max_f), (int)roundf(wx.temp_min_f));
         txtR(mmbuf, TFT_DISP_W - 4, 65, TXT_LABEL, 1);
 
         // ── SEPARATOR ────────────────────────────────────────
@@ -331,7 +350,7 @@ void drawWeatherScreen(){
         if(wx.precip_mm < 0.1f)
             snprintf(pbuf, sizeof(pbuf), "NO PRECIP TODAY");
         else
-            snprintf(pbuf, sizeof(pbuf), "PRECIP: %.1f mm", wx.precip_mm);
+            snprintf(pbuf, sizeof(pbuf), "PRECIP: %.2f in", wx.precip_mm / 25.4f);
         txtC(pbuf, 111, TXT_SECONDARY, 1);
 
     } else {
@@ -349,9 +368,9 @@ void drawWeatherScreen(){
         const char* days[]   = {"SUN","MON","TUE","WED","THU","FRI","SAT"};
         const char* months[] = {"JAN","FEB","MAR","APR","MAY","JUN",
                                  "JUL","AUG","SEP","OCT","NOV","DEC"};
-        char datebuf[20];
-        snprintf(datebuf, sizeof(datebuf), "%s %02d %s",
-                 days[ti.tm_wday], ti.tm_mday, months[ti.tm_mon]);
+        char datebuf[24];
+        snprintf(datebuf, sizeof(datebuf), "%s %02d %s %04d",
+                 days[ti.tm_wday], ti.tm_mday, months[ti.tm_mon], ti.tm_year + 1900);
         txt(datebuf, 4, TFT_DISP_H - 45, TXT_DIM, 1);
     }
 
@@ -367,10 +386,13 @@ bool fetchWeather(){
     snprintf(url, sizeof(url),
         "http://api.open-meteo.com/v1/forecast"
         "?latitude=%.4f&longitude=%.4f"
+        // The API returns temperatures in Celsius, wind in km/h, and
+        // precipitation in millimeters; the display converts as needed.
         "&current=temperature_2m,apparent_temperature,relative_humidity_2m,"
         "precipitation,weather_code,wind_speed_10m,wind_direction_10m,is_day"
         "&daily=temperature_2m_max,temperature_2m_min,uv_index_max,precipitation_sum"
         "&timezone=auto"
+        // Only today's daily totals are needed, so each daily array uses [0].
         "&forecast_days=1",
         LOC_LAT, LOC_LON);
 
@@ -396,24 +418,55 @@ bool fetchWeather(){
         return false;
     }
 
-    JsonObject cur = doc["current"];
-    JsonObject dai = doc["daily"];
+    // Check the response shape and every value used by the display before
+    // changing wx. This keeps a partial API response from replacing good data
+    // with zeroes or a mixture of old and new readings.
+    JsonObjectConst cur = doc["current"].as<JsonObjectConst>();
+    JsonObjectConst dai = doc["daily"].as<JsonObjectConst>();
+    JsonVariantConst tempC = cur["temperature_2m"];
+    JsonVariantConst feelsLikeC = cur["apparent_temperature"];
+    JsonVariantConst humidity = cur["relative_humidity_2m"];
+    JsonVariantConst weatherCode = cur["weather_code"];
+    JsonVariantConst windKmh = cur["wind_speed_10m"];
+    JsonVariantConst windDir = cur["wind_direction_10m"];
+    JsonVariantConst isDay = cur["is_day"];
+    JsonVariantConst precipMm = dai["precipitation_sum"][0];
+    JsonVariantConst tempMaxC = dai["temperature_2m_max"][0];
+    JsonVariantConst tempMinC = dai["temperature_2m_min"][0];
+    JsonVariantConst uvIndex = dai["uv_index_max"][0];
 
-    wx.temp_c       = celsiusToFahrenheit(cur["temperature_2m"] | 0.0f);
-    wx.feels_like_c = celsiusToFahrenheit(cur["apparent_temperature"] | 0.0f);
-    wx.humidity     = cur["relative_humidity_2m"]    | 0;
-    wx.precip_mm    = dai["precipitation_sum"][0]    | 0.0f;
-    wx.weather_code = cur["weather_code"]            | 0;
-    wx.wind_kmh     = cur["wind_speed_10m"]          | 0.0f;
-    wx.wind_dir     = cur["wind_direction_10m"]      | 0;
-    wx.is_day       = (cur["is_day"] | 1) == 1;
-    wx.temp_max_c   = celsiusToFahrenheit(dai["temperature_2m_max"][0] | 0.0f);
-    wx.temp_min_c   = celsiusToFahrenheit(dai["temperature_2m_min"][0] | 0.0f);
-    wx.uv_index     = (int)(dai["uv_index_max"][0]   | 0.0f);
-    wx.valid        = true;
+    if(cur.isNull() || dai.isNull() ||
+       (!tempC.is<int>() && !tempC.is<float>()) ||
+       (!feelsLikeC.is<int>() && !feelsLikeC.is<float>()) ||
+       !humidity.is<int>() || !weatherCode.is<int>() ||
+       (!windKmh.is<int>() && !windKmh.is<float>()) ||
+       !windDir.is<int>() || !isDay.is<int>() ||
+       (!precipMm.is<int>() && !precipMm.is<float>()) ||
+       (!tempMaxC.is<int>() && !tempMaxC.is<float>()) ||
+       (!tempMinC.is<int>() && !tempMinC.is<float>()) ||
+       (!uvIndex.is<int>() && !uvIndex.is<float>())){
+        Serial.println("[JSON] Response is missing one or more weather values");
+        return false;
+    }
+
+    // Build the next reading locally and publish it only after validation.
+    WeatherData next = {};
+    next.temp_f       = celsiusToFahrenheit(tempC.as<float>());
+    next.feels_like_f = celsiusToFahrenheit(feelsLikeC.as<float>());
+    next.humidity     = humidity.as<int>();
+    next.precip_mm    = precipMm.as<float>();
+    next.weather_code = weatherCode.as<int>();
+    next.wind_kmh     = windKmh.as<float>();
+    next.wind_dir     = windDir.as<int>();
+    next.is_day       = isDay.as<int>() == 1;
+    next.temp_max_f   = celsiusToFahrenheit(tempMaxC.as<float>());
+    next.temp_min_f   = celsiusToFahrenheit(tempMinC.as<float>());
+    next.uv_index     = (int)uvIndex.as<float>();
+    next.valid        = true;
+    wx = next;
 
     Serial.printf("[WX] T=%.1f FL=%.1f H=%d%% W=%.0f code=%d UV=%d\n",
-                  wx.temp_c, wx.feels_like_c, wx.humidity,
+                  wx.temp_f, wx.feels_like_f, wx.humidity,
                   kmhToMph(wx.wind_kmh), wx.weather_code, wx.uv_index);
     return true;
 }
@@ -431,59 +484,68 @@ void showLoading(const char* msg){
 // ── Boot Intro ────────────────────────────────────────────────
 void playIntro(){
     tft.fillScreen(CLR_BLACK);
-    // Animate fade-in title
-    for(int i = 0; i < 4; i++){
-        tft.fillScreen(CLR_BLACK);
-        uint8_t b = 40 + i * 55;
+    // Fade the title in smoothly without redrawing the whole screen each frame.
+    for(int i = 0; i < 8; i++){
+        uint8_t b = 28 + i * 28;
         uint16_t col = rgb(0, b, b);
         txtC("WEATHER",  36, col, 2);
         txtC("STATION",  56, col, 2);
-        delay(120);
+        delay(60);
     }
+    // Show the final title and initialization status at full accent color.
     txtC("WEATHER",  36, ACCENT_TEAL, 2);
     txtC("STATION",  56, ACCENT_TEAL, 2);
-    txtC("INITIALIZING...", 84, TXT_DIM, 1);
+    txtC("INITIALIZING", 84, TXT_DIM, 1);
     delay(700);
 }
 
-// ── WiFi Connect ──────────────────────────────────────────────
-void connectWifi(){
-    showLoading("CONNECTING TO WIFI...");
-
+// ── WiFi Connection Management ────────────────────────────────
+// Start an attempt without waiting here; the display and weather refresh can
+// continue while the ESP32 associates with the access point.
+void beginWifiAttempt(){
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    lastWifiAttempt = millis();
+    wifiAttemptStarted = lastWifiAttempt;
+    wifiAttemptPending = true;
+    Serial.println("[WiFi] Connection attempt started");
+}
 
-    const char* frames[] = {"[     ]","[=    ]","[==   ]","[===  ]","[==== ]","[=====]"};
-    int f = 0, tries = 0;
+// Track connection transitions, configure local time after each successful
+// connection, and retry periodically instead of permanently blocking on error.
+void updateWifiConnection(){
+    unsigned long now = millis();
+    bool connected = WiFi.status() == WL_CONNECTED;
 
-    while(WiFi.status() != WL_CONNECTED){
-        tft.fillRect(70, 78, 100, 12, BG);
-        tft.setTextSize(1);
-        tft.setTextColor(ACCENT_BLUE);
-        tft.setCursor(70, 80);
-        tft.print(frames[f % 6]);
-        f++;
-        delay(300);
-        tries++;
-        if(tries > 60){
-            showLoading("WIFI TIMEOUT");
-            txtC("CHECK CREDENTIALS", 80, ACCENT_RED, 1);
-            txtC("IN PLATFORMIO.INI", 92, ACCENT_RED, 1);
-            while(true) delay(1000);
+    if(connected){
+        if(!wifiConnected){
+            wifiConnected = true;
+            wifiAttemptPending = false;
+            configTzTime(TIMEZONE, "pool.ntp.org", "time.nist.gov");
+            weatherFetchPending = true;
+            wifiStatusChanged = true;
+            Serial.println("[WiFi] Connected: " + WiFi.localIP().toString());
         }
+        return;
     }
 
-    // Sync NTP
-    configTime(UTC_OFFSET * 3600, 0,
-               "pool.ntp.org", "time.nist.gov");
+    if(wifiConnected){
+        wifiConnected = false;
+        wifiStatusChanged = true;
+        Serial.println("[WiFi] Connection lost; waiting to retry");
+    }
 
-    showLoading("SYNCING TIME...");
-    struct tm ti;
-    int ntpTries = 0;
-    while(!getLocalTime(&ti) && ntpTries++ < 20) delay(500);
+    // A timed-out attempt is allowed to expire; the retry interval below
+    // prevents calling WiFi.begin repeatedly while the radio is still trying.
+    if(wifiAttemptPending &&
+       now - wifiAttemptStarted >= WIFI_CONNECT_TIMEOUT_MS){
+        wifiAttemptPending = false;
+        Serial.println("[WiFi] Connection attempt timed out");
+    }
 
-    wifiConnected = true;
-    String ipStr = WiFi.localIP().toString();
-    Serial.println("[WiFi] Connected: " + ipStr);
+    if(!wifiAttemptPending &&
+       (lastWifiAttempt == 0 || now - lastWifiAttempt >= WIFI_RETRY_INTERVAL_MS)){
+        beginWifiAttempt();
+    }
 }
 
 // ── Setup ─────────────────────────────────────────────────────
@@ -498,19 +560,24 @@ void setup(){
     tft.fillScreen(CLR_BLACK);
 
     playIntro();
-    connectWifi();
-
-    // First fetch
-    showLoading("LOADING WEATHER...");
-    fetchWeather();
+    showLoading("CONNECTING TO WIFI");
+    beginWifiAttempt();
     lastUpdate = millis();
-
     drawWeatherScreen();
 }
 
 // ── Loop ──────────────────────────────────────────────────────
 void loop(){
     unsigned long now = millis();
+    updateWifiConnection();
+    now = millis();
+
+    // Refresh the header as soon as the network address becomes available,
+    // or clear it after Wi-Fi disconnects.
+    if(wifiStatusChanged){
+        wifiStatusChanged = false;
+        drawWeatherScreen();
+    }
 
     //   heartbeat dot every second
     if(now - lastPulse >= 1000UL){
@@ -519,9 +586,11 @@ void loop(){
         tft.fillCircle(233, 129, 2, pulseOn ? GREEN : DOT_OFF);
     }
 
-    // Refresh weather data every UPDATE_INTERVAL_MS
-    if(now - lastUpdate >= UPDATE_INTERVAL_MS || firstDraw){
-        firstDraw = false;
+    // Fetch once after connecting, then refresh at the normal interval.
+    // Failed fetches keep the last valid reading and are retried next interval.
+    if(wifiConnected &&
+       (weatherFetchPending || now - lastUpdate >= UPDATE_INTERVAL_MS)){
+        weatherFetchPending = false;
         bool ok = fetchWeather();
         lastUpdate = millis();
         if(ok || wx.valid){

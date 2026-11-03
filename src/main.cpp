@@ -44,7 +44,7 @@ Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 // Change these values to move the station to another location.
 static const float  LOC_LAT      = 41.1092;
 static const float  LOC_LON      = -111.9465;
-static const char*  LOC_NAME     = "OGDEN UTAH";
+static const char*  LOC_NAME     = "NORTH OGDEN, UTAH";
 
 // POSIX timezone rules for Mountain Time, including the daylight-saving
 // transition dates used in the United States.
